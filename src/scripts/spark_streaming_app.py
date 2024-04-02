@@ -1,12 +1,20 @@
 from time import sleep
+import logging
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as f
 from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
 
+# Настроим логгер
+logging.basicConfig(level=logging.ERROR)  # или logging.DEBUG для более подробного логирования
+logger = logging.getLogger(__name__)
+
 # Задаем имена входящего и исходящего топиков
 TOPIC_NAME_IN = 'student.topic.cohort20.antodnv'
 TOPIC_NAME_OUT = 'student.topic.cohort20.antodnv.out'
+
+# определяем текущее время в UTC в миллисекундах, затем округляем до секунд
+current_timestamp_utc = int(round(unix_timestamp(current_timestamp())))
 
 # Необходимые библиотеки для интеграции Spark с Kafka и PostgreSQL
 spark_jars_packages = ",".join(
@@ -68,13 +76,19 @@ def spark_init(spark_name = 'RestaurantSubscribeStreamingService') -> SparkSessi
     return spark
 
 
-# Читаем из топика Kafka сообщения с акциями от ресторанов. Сразу десериализуемБ обрабатываем и фильтруем данные
-def filtered_read_stream(spark: SparkSession, options: dict, schema: StructType) -> DataFrame:
+# Читаем из топика Kafka сообщения с акциями от ресторанов.
+def read_kafka_stream(spark: SparkSession, options: dict) -> DataFrame:
     df = (spark.readStream
           .format('kafka')
           .options(**options)
           .option("subscribe", TOPIC_NAME_IN)
-          .load()
+          .load())
+    
+    return df
+
+# Обрабатываем полученные данные: десериализуем, обогащаем и фильтруем
+def filter_stream_data(df: DataFrame, schema: StructType, current_timestamp_utc:TimestampType) -> DataFrame:
+    df = (df
           .withColumn('value', f.col('value').cast(StringType()))
           .withColumn('event', f.from_json(f.col('value'), schema))
           .selectExpr('event.*')
@@ -83,7 +97,7 @@ def filtered_read_stream(spark: SparkSession, options: dict, schema: StructType)
                       .cast(TimestampType()))
           .dropDuplicates(['client_id', 'timestamp'])
           .withWatermark('timestamp', '5 minutes')
-          .withColumn('trigger_datetime_created', f.unix_timestamp(f.current_timestamp()))
+          .withColumn('trigger_datetime_created', current_timestamp_utc)
           .filter('''trigger_datetime_created >= adv_campaign_datetime_start 
                      and 
                      adv_campaign_datetime_end >= trigger_datetime_created''')
@@ -130,23 +144,29 @@ def foreach_batch_function(df: DataFrame):
             ]
     
     # Записываем df в Postgre в таблицу subscribers_feedback. Добавляем поле feedback
-    ( df.select(columns) 
-        .withColumn('feedback', f.lit('')) 
-        .write.format("jdbc") 
-        .mode('append') 
-        .options(**postgresql_feedback_settings) 
-        .save()
-    )
-
+    try:
+        ( df.select(columns) 
+            .withColumn('feedback', f.lit('')) 
+            .write.format("jdbc") 
+            .mode('append') 
+            .options(**postgresql_feedback_settings) 
+            .save()
+        )
+    except Exception as e:
+        logger.error(f"Error writing to PostgreSQL: {str(e)}")
+    
     # Пишем в топик kafka
-    ( df.select(f.to_json(f.struct(columns)).alias('value')) 
-        .write 
-        .mode("append") 
-        .format("kafka") 
-        .options(**kafka_security_options) 
-        .option("topic", TOPIC_NAME_OUT) 
-        .save()
-    )
+    try:
+        ( df.select(f.to_json(f.struct(columns)).alias('value')) 
+            .write 
+            .mode("append") 
+            .format("kafka") 
+            .options(**kafka_security_options) 
+            .option("topic", TOPIC_NAME_OUT) 
+            .save()
+        )
+    except Exception as e:
+        logger.error(f"Error writing to Kafka: {str(e)}")
 
     # Удаляем сохраненный df из памяти
     df.unpersist()
@@ -155,7 +175,9 @@ def foreach_batch_function(df: DataFrame):
 # Собираем и запускаем код
 if __name__ == "__main__":
     spark = spark_init('RestaurantSubscribeStreamingService')
-    filtered_read_stream_df = filtered_read_stream(spark, kafka_security_options, incomming_message_schema)
+    restaurant_read_stream_df = read_kafka_stream(spark, kafka_security_options)
+    filtered_read_stream_df = filter_stream_data(restaurant_read_stream_df, 
+                                                   incomming_message_schema, current_timestamp_utc)
     subscribers_restaurant_df = subscribers_restaurant(spark, postgresql_restaurants_settings)
     output = join(filtered_read_stream_df, subscribers_restaurant_df)
     query = (output
